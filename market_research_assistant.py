@@ -11,6 +11,8 @@ from langchain_core.prompts import ChatPromptTemplate
 # =============================================================================
 # PAGE CONFIGURATION
 # =============================================================================
+# Using centered layout to keep the UI readable on large screens.
+# Wide layout caused content to spread too thin on high-res monitors.
 st.set_page_config(
     page_title="Market Research Assistant",
     page_icon="📊",
@@ -21,6 +23,10 @@ st.set_page_config(
 # =============================================================================
 # GLOBAL CSS
 # =============================================================================
+# Custom styling to give the app a professional, card-based look.
+# I chose DM Sans for readability and DM Mono for timing displays.
+# The step badges, connectors, and report area are all styled here
+# so the workflow feels like a guided process rather than a plain form.
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=DM+Mono:wght@400;500&display=swap');
@@ -163,17 +169,25 @@ st.markdown("""
 # =============================================================================
 # CONSTANTS (SAFETY & PERFORMANCE)
 # =============================================================================
-MAX_VALIDATION_TIME = 15        # seconds
-MAX_RETRIEVAL_TIME = 60         # seconds
-MAX_GENERATION_TIME = 60        # seconds
-MAX_CONTEXT_CHARS = 12000       # total Wikipedia text sent to LLM
-MAX_REPORT_WORDS = 500
-REQUIRED_WIKI_PAGES = 5
+# These constants act as guardrails for the entire pipeline.
+# Each timeout is tuned based on testing — validation is fast (single LLM call),
+# retrieval is slower (multiple scoring calls), and generation depends on report length.
+# MAX_CONTEXT_CHARS prevents sending too much text to the LLM, which would
+# increase cost, slow down generation, and risk hitting token limits.
+MAX_VALIDATION_TIME = 15        # seconds — single LLM call, should be quick
+MAX_RETRIEVAL_TIME = 60         # seconds — includes Wikipedia API + scoring each page
+MAX_GENERATION_TIME = 60        # seconds — generating a 500-word structured report
+MAX_CONTEXT_CHARS = 12000       # total Wikipedia text sent to LLM (avoids token overflow)
+MAX_REPORT_WORDS = 500          # enforced both in the prompt and post-generation
+REQUIRED_WIKI_PAGES = 5         # target number of sources for a well-grounded report
 
 
 # =============================================================================
 # API KEY CONFIGURATION
 # =============================================================================
+# Secrets-based approach for deployment (Streamlit Cloud handles this securely).
+# The fallback text input is only for local development — it's password-masked
+# so the key is never visible on screen. The key is never stored in the code.
 try:
     api_key = st.secrets["OPENAI_API_KEY"]
     using_secrets = True
@@ -196,6 +210,9 @@ if not using_secrets:
 else:
     st.sidebar.success("🔐 Using secure API key")
 
+# Model and page count are shown but disabled — this keeps the UI transparent
+# about what settings are being used, while preventing the user from changing
+# them and potentially breaking the pipeline or running up costs.
 st.sidebar.selectbox(
     "Model",
     ["gpt-5-mini"],
@@ -231,6 +248,11 @@ st.markdown(
 # =============================================================================
 # SESSION STATE INITIALIZATION
 # =============================================================================
+# Streamlit re-runs the entire script on every interaction, so session state
+# is essential to persist data between steps. Each key tracks a specific part
+# of the workflow. The retrieval_message fields exist because st.rerun() wipes
+# any st.success/st.warning messages — storing them in state lets us re-display
+# them after the rerun.
 DEFAULT_STATE = {
     "industry_valid": False,
     "sources_ready": False,
@@ -243,8 +265,8 @@ DEFAULT_STATE = {
     "validation_time": 0,
     "retrieval_time": 0,
     "generation_time": 0,
-    "retrieval_message": "",
-    "retrieval_message_type": ""
+    "retrieval_message": "",         # persists feedback across st.rerun()
+    "retrieval_message_type": ""     # "success" or "warning"
 }
 
 for key, value in DEFAULT_STATE.items():
@@ -255,6 +277,8 @@ for key, value in DEFAULT_STATE.items():
 # =============================================================================
 # START OVER
 # =============================================================================
+# Resets all session state so the user can research a different industry
+# without refreshing the browser. Also clears the text input widget.
 col_reset_btn, col_reset_hint = st.columns([1, 4])
 with col_reset_btn:
     if st.button("🔄 Start Over"):
@@ -273,6 +297,8 @@ with col_reset_hint:
 # =============================================================================
 # CHECK API KEY
 # =============================================================================
+# Hard stop if no key is configured — there's no point rendering the rest
+# of the UI if the LLM calls will fail anyway.
 if not api_key:
     st.warning("⚠️ Please configure an OpenAI API key to proceed.")
     st.stop()
@@ -281,6 +307,8 @@ if not api_key:
 # =============================================================================
 # HELPER: Render step header HTML
 # =============================================================================
+# Generates the numbered badge (1/2/3) that turns into a green checkmark
+# when the step completes. Also shows elapsed time for completed steps.
 def step_header_html(number, title, done=False, elapsed=None):
     badge = f'<span class="step-badge done">✓</span>' if done else f'<span class="step-badge">{number}</span>'
     time_html = f'<span class="step-subtitle">⏱ {elapsed:.2f}s</span>' if done and elapsed and elapsed > 0 else ''
@@ -290,15 +318,19 @@ def step_header_html(number, title, done=False, elapsed=None):
 # =============================================================================
 # HELPER: Convert markdown report to HTML
 # =============================================================================
+# The LLM outputs markdown (# and ## headers), but we need to render the report
+# inside a styled <div>. Streamlit's st.markdown() can't nest content inside
+# custom HTML divs across multiple calls, so we convert the markdown to HTML
+# and render everything in a single st.markdown() call.
+# We also strip backticks as a safety net — the prompt tells the LLM not to
+# use them, but LLMs don't always follow instructions perfectly.
 def report_to_html(report_text):
     """Convert the LLM markdown report to HTML for rendering inside a styled div."""
-    # Strip backticks the LLM may have added
     html = report_text.replace('`', '')
-    # Convert ## headers first (before # headers)
+    # Must convert ## before # to avoid ## being matched by the # pattern
     html = re.sub(r'^## (.+)$', r'<h2>\1</h2>', html, flags=re.MULTILINE)
-    # Convert # headers
     html = re.sub(r'^# (.+)$', r'<h1>\1</h1>', html, flags=re.MULTILINE)
-    # Wrap non-empty, non-tag lines in <p> tags
+    # Wrap remaining text lines in <p> tags for consistent styling
     lines = html.split('\n')
     converted = []
     for line in lines:
@@ -313,6 +345,9 @@ def report_to_html(report_text):
 # =============================================================================
 # STEP 1 — INDUSTRY INPUT & VALIDATION
 # =============================================================================
+# This is the first guardrail in the pipeline. The LLM validates whether the
+# input is a real, researchable industry BEFORE any Wikipedia calls are made.
+# This prevents wasted API calls and ensures the retrieval step gets clean input.
 with st.container(border=True):
     st.markdown(
         step_header_html(1, "Validate Industry",
@@ -322,14 +357,25 @@ with st.container(border=True):
         unsafe_allow_html=True
     )
 
+    # Caching validation results so the same industry isn't re-validated on every
+    # Streamlit rerun. The api_key_value parameter is included in the cache hash
+    # so that different API keys produce fresh results.
     @st.cache_data(show_spinner=False)
     def validate_industry(industry_name: str, api_key_value: str) -> str:
+        # temperature=0.0 because validation needs to be deterministic —
+        # the same input should always get the same VALID/INVALID/INAPPROPRIATE result.
         llm = ChatOpenAI(
             model="gpt-5-mini",
             temperature=0.0,
             api_key=api_key_value
         )
 
+        # The prompt handles three categories of bad input:
+        # 1. INAPPROPRIATE — offensive/harmful content (blocked immediately)
+        # 2. INVALID — abstract concepts, typos, non-words, overly broad terms
+        # 3. VALID — real industries that can support market structure analysis
+        # SUGGESTED_ALTERNATIVES helps the user recover from invalid input
+        # without having to guess what a "valid industry" looks like.
         system_prompt = (
             "You are validating user input for a corporate market research application.\n\n"
             "First, check if the input contains inappropriate, offensive, or sensitive content:\n"
@@ -364,6 +410,8 @@ with st.container(border=True):
 
         return response.content
 
+    # Using st.form so that pressing Enter in the text field triggers validation
+    # directly, without needing to click the button separately.
     with st.form(key="validation_form"):
         industry = st.text_input(
             "Industry name",
@@ -378,6 +426,8 @@ with st.container(border=True):
 
     if submitted and industry:
 
+        # If the user changed the industry, reset downstream steps so stale
+        # sources/report from the previous industry don't carry over.
         if industry != st.session_state.current_industry:
             st.session_state.sources_ready = False
             st.session_state.report_generated = False
@@ -397,6 +447,8 @@ with st.container(border=True):
         elapsed = time.time() - start
         st.session_state.validation_time = elapsed
 
+        # Timeout guardrail — if validation takes too long, the input is likely
+        # too vague and is causing the LLM to struggle.
         if elapsed > MAX_VALIDATION_TIME:
             st.error(
                 "⚠️ Validation took too long. This usually means the industry is too vague.\n\n"
@@ -406,6 +458,8 @@ with st.container(border=True):
 
         st.session_state.industry_feedback = feedback
 
+        # Route to the appropriate response based on the LLM's verdict.
+        # INAPPROPRIATE is checked first since it's the most critical guardrail.
         if "VALIDITY: INAPPROPRIATE" in feedback:
             st.error("❌ The input contains inappropriate or offensive content. Please enter a valid industry name.\n\n")
             st.session_state.industry_valid = False
@@ -417,22 +471,30 @@ with st.container(border=True):
             st.error("❌ Industry is not suitable for structured market research.\n\n")
             st.session_state.industry_valid = False
 
+        # Validation details are in an expander so the user can see the full
+        # LLM reasoning (including suggested alternatives) without cluttering the UI.
         with st.expander("📋 Validation Details", expanded=True):
             st.markdown(feedback)
 
+    # On rerun (after the page refreshes), re-display the validation status
+    # from session state so the user doesn't lose context.
     elif st.session_state.industry_valid and st.session_state.industry_feedback:
         st.success(f"✅ Industry '{st.session_state.current_industry}' is validated.")
         with st.expander("📋 View Validation Details"):
             st.markdown(st.session_state.industry_feedback)
 
 
-# Connector
+# Visual connector between steps
 st.markdown('<div class="connector"></div>', unsafe_allow_html=True)
 
 
 # =============================================================================
-# STEP 2 — WIKIPEDIA RETRIEVAL
+# STEP 2 — WIKIPEDIA RETRIEVAL & RELEVANCE SCORING
 # =============================================================================
+# This step retrieves Wikipedia pages and scores each one for industry-level
+# relevance. The scoring is a critical guardrail — without it, Wikipedia returns
+# a mix of company pages, country economy pages, and tangential topics that
+# would produce a low-quality report.
 with st.container(border=True):
     st.markdown(
         step_header_html(2, "Retrieve Wikipedia Sources",
@@ -442,12 +504,21 @@ with st.container(border=True):
         unsafe_allow_html=True
     )
 
+    # Button is disabled until Step 1 completes — enforces the sequential workflow.
     if not st.session_state.industry_valid:
         st.button("📚 Retrieve Wikipedia Pages", disabled=True)
 
     else:
 
         def score_relevance(docs, industry_name, api_key):
+            """Score each Wikipedia page for industry-level relevance using the LLM.
+            
+            This is the source quality guardrail. Without it, the report generator
+            would receive irrelevant pages and either hallucinate or produce a
+            generic report that doesn't actually cover the target industry.
+            """
+            # temperature=0.0 for consistent, deterministic scoring.
+            # Each page should always get the same relevance score.
             llm = ChatOpenAI(
                 model="gpt-5-mini",
                 temperature=0.0,
@@ -458,8 +529,16 @@ with st.container(border=True):
 
             for doc in docs:
                 title = doc.metadata.get("title", "")
+                # Only send first 1000 chars of each page to keep scoring fast
+                # and avoid hitting token limits when processing many pages.
                 summary = doc.page_content[:1000]
 
+                # The scoring prompt explicitly penalises common failure modes:
+                # - Country economy pages (e.g. "Economy of Puerto Rico") → score 1
+                # - General technology pages (e.g. "Digital twin") → score 1
+                # - Individual company pages (e.g. "McLaren Automotive") → score 2
+                # This was tuned through testing — earlier versions scored these
+                # too high, which led to poor source selection.
                 prompt = ChatPromptTemplate.from_messages([
                     ("system",
                      "You are evaluating how relevant a Wikipedia page is for "
@@ -484,8 +563,10 @@ with st.container(border=True):
                 try:
                     score = int(llm.invoke(prompt.format_messages()).content.strip())
                     scored_docs.append((score, doc))
+                # ValueError/TypeError if LLM returns non-numeric text — skip that page
                 except (ValueError, TypeError) as e:
                     continue
+                # Catch API errors (rate limits, network issues) with a visible warning
                 except Exception as e:
                     st.warning(f"⚠️ Could not score '{title}': {str(e)}")
                     continue
@@ -494,19 +575,31 @@ with st.container(border=True):
             return scored_docs
 
 
-        # Version key: bump this whenever the scoring prompt or retrieval logic changes
+        # Cache version key: changing this invalidates all cached retrieval results.
+        # This is necessary because the cache is keyed on function arguments only,
+        # so changes to the scoring prompt (inside the function body) wouldn't
+        # otherwise trigger fresh results. Bump this whenever the prompt changes.
         _RETRIEVAL_CACHE_VERSION = "v7_revert_industry"
 
         @st.cache_data(show_spinner=False)
         def retrieve_wikipedia(industry_name: str, api_key_value: str, _cache_version: str = _RETRIEVAL_CACHE_VERSION):
-
+            """Retrieve Wikipedia pages and score them for industry relevance.
+            
+            Results are cached so repeated searches for the same industry
+            don't re-call Wikipedia and the scoring LLM unnecessarily.
+            """
+            # top_k_results=8 and load_max_docs=10 are tuned for balance:
+            # enough candidates to find 5 good ones, but not so many that
+            # scoring takes too long (each page = one LLM call).
             retriever = WikipediaRetriever(
                 top_k_results=8,
                 doc_content_chars_max=4000,
                 load_max_docs=10
             )
 
-            # Append 'industry' to bias Wikipedia toward industry-level pages
+            # Appending "industry" to the search query biases Wikipedia's results
+            # toward pages like "Automotive industry" instead of company pages.
+            # Tested alternatives like "sector overview" but "industry" performed best.
             initial_docs = retriever.invoke(f"{industry_name} industry")
 
             if len(initial_docs) == 0:
@@ -548,6 +641,10 @@ with st.container(border=True):
                 st.session_state.sources_ready = False
 
             else:
+                # Adaptive threshold selection: try to get the best sources available.
+                # Prefer score >= 4 (direct industry pages), fall back to >= 3,
+                # then >= 2. This ensures we always proceed with something usable
+                # while communicating source quality honestly to the user.
                 high_quality = [doc for score, doc in scored_docs if score >= 4]
                 medium_quality = [doc for score, doc in scored_docs if score >= 3]
                 low_quality = [doc for score, doc in scored_docs if score >= 2]
@@ -586,29 +683,39 @@ with st.container(border=True):
                     for doc in selected
                 ]
                 st.session_state.sources_ready = True
+                # Force a clean re-render so sources display properly inside
+                # the container. Without this, Streamlit's rendering can show
+                # duplicate content from the current run mixed with the rerun.
                 st.rerun()
 
-        # Display retrieval message from session state (persists across reruns)
+        # These messages are stored in session state (not displayed directly)
+        # because st.rerun() above wipes any st.success/st.warning from the
+        # current run. Re-displaying from state ensures the user always sees them.
         if st.session_state.retrieval_message:
             if st.session_state.retrieval_message_type == "success":
                 st.success(st.session_state.retrieval_message)
             else:
                 st.warning(st.session_state.retrieval_message)
 
-        # Display sources from session state (persists across reruns)
+        # Show all source URLs so the analyst can verify them — transparency
+        # is important for a business tool where decisions depend on the output.
         if st.session_state.sources_ready and st.session_state.urls:
             st.markdown("**Wikipedia Sources Used:**")
             for i, url in enumerate(st.session_state.urls, 1):
                 st.markdown(f"{i}. [{url}]({url})")
 
 
-# Connector
+# Visual connector between steps
 st.markdown('<div class="connector"></div>', unsafe_allow_html=True)
 
 
 # =============================================================================
 # STEP 3 — REPORT GENERATION
 # =============================================================================
+# The report generator is the final step. It takes the filtered Wikipedia sources
+# and produces a structured executive report. Multiple guardrails operate here:
+# hallucination prevention (source-only instruction), output length control
+# (prompt + post-generation check), and content moderation in the prompt.
 with st.container(border=True):
     st.markdown(
         step_header_html(3, "Generate Report",
@@ -628,6 +735,9 @@ with st.container(border=True):
 
             with st.spinner("✍️ Generating industry report..."):
 
+                # Build the context from selected sources, respecting the character
+                # limit. This prevents sending too much text to the LLM, which would
+                # increase latency and risk hitting the model's context window.
                 context_parts = []
                 total_chars = 0
 
@@ -639,6 +749,10 @@ with st.container(border=True):
 
                 context = "\n\n".join(context_parts)
 
+                # temperature=0.2 for report generation — slightly creative for
+                # natural-sounding prose, but low enough to stay factual and
+                # not invent information. This is higher than validation (0.0)
+                # because we want readable text, not just classification.
                 llm = ChatOpenAI(
                     model="gpt-5-mini",
                     temperature=0.2,
@@ -648,6 +762,13 @@ with st.container(border=True):
                 from datetime import date
                 today = date.today().strftime("%B %d, %Y")
                 
+                # The report prompt has several layers of guardrails:
+                # 1. "Use ONLY the provided Wikipedia sources" — hallucination prevention
+                # 2. "Do NOT introduce external knowledge" — reinforces #1
+                # 3. Word limit in the prompt + post-generation verification
+                # 4. "Do NOT use backticks" — prevents formatting issues in the UI
+                # 5. Content moderation section — ensures professional output
+                # 6. Structured sections with distinct content rules to avoid repetition
                 report_prompt = ChatPromptTemplate.from_messages([
                     ("system",
                      f"You are a senior market research analyst at a large multinational corporation.\n"
@@ -733,12 +854,16 @@ with st.container(border=True):
     # Display the report (persists across reruns)
     if st.session_state.report:
 
+        # Convert markdown to HTML and render inside the styled report area.
         report_html = report_to_html(st.session_state.report)
         st.markdown(
             f'<div class="report-area">{report_html}</div>',
             unsafe_allow_html=True
         )
 
+        # Post-generation word count check — this is a second layer of defence
+        # beyond the prompt instruction. If the LLM exceeds the limit despite
+        # being told not to, the user sees a clear warning.
         clean_report = st.session_state.report.replace('`', '')
         wc = len(clean_report.split())
         
@@ -747,6 +872,8 @@ with st.container(border=True):
         else:
             st.warning(f"⚠️ **Word count:** {wc} / {MAX_REPORT_WORDS} (exceeds limit)")
 
+        # Download as markdown so the analyst can use the report elsewhere —
+        # paste into a deck, email it, or convert to PDF.
         st.download_button(
             label="📥 Download Report",
             data=st.session_state.report,
