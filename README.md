@@ -4,7 +4,7 @@
 
 **Live pipeline:** Industry validation → Wikipedia retrieval & relevance scoring → Executive report generation
 
-Built with **Streamlit**, **LangChain**, and **OpenAI GPT** as part of the MSIN0231 Machine Learning for Business course.
+Built with **Streamlit**, **LangChain**, and **OpenAI GPT**.
 
 ---
 
